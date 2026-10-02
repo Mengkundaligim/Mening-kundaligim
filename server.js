@@ -3,6 +3,7 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const { timingSafeEqual } = require("node:crypto");
 
 const ROOT = __dirname;
 const PORT = Number(process.env.PORT) || 3000;
@@ -13,9 +14,17 @@ const RATE_LIMIT = 20;
 const RATE_WINDOW = 60_000;
 const DAILY_LIMIT = 500;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "";
+const SMS_CLIENT_KEY = process.env.SMS_CLIENT_KEY || "";
+const ESKIZ_EMAIL = process.env.ESKIZ_EMAIL || "";
+const ESKIZ_PASSWORD = process.env.ESKIZ_PASSWORD || "";
+const ESKIZ_FROM = process.env.ESKIZ_FROM || "4546";
 const LANGUAGES = new Set(["uz", "ru", "en"]);
 const rateBuckets = new Map();
+const sentSmsKeys = new Map();
+const pendingSmsKeys = new Set();
 let dailyBucket = { date: new Date().toISOString().slice(0, 10), count: 0 };
+let eskizToken = "";
+let eskizTokenAt = 0;
 const greetingReplies = {
     uz: {
         greeting: "Salom! Kunora bo‘yicha qanday yordam kerak?",
@@ -218,6 +227,9 @@ function cleanupRateBuckets() {
     for (const [key, value] of rateBuckets) {
         if (now - value.startedAt >= RATE_WINDOW) rateBuckets.delete(key);
     }
+    for (const [key, sentAt] of sentSmsKeys) {
+        if (now - sentAt >= 48 * 60 * 60 * 1000) sentSmsKeys.delete(key);
+    }
 }
 
 function requestIp(req) {
@@ -241,6 +253,95 @@ function withinDailyLimit() {
     if (dailyBucket.count >= DAILY_LIMIT) return false;
     dailyBucket.count += 1;
     return true;
+}
+
+function hasValidSmsKey(value) {
+    if (SMS_CLIENT_KEY.length < 32 || typeof value !== "string") return false;
+    const expected = Buffer.from(SMS_CLIENT_KEY);
+    const actual = Buffer.from(value);
+    return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+async function getEskizToken(forceRefresh = false) {
+    if (!forceRefresh && eskizToken && Date.now() - eskizTokenAt < 20 * 24 * 60 * 60 * 1000) return eskizToken;
+    const body = new URLSearchParams({ email: ESKIZ_EMAIL, password: ESKIZ_PASSWORD });
+    const response = await fetch("https://notify.eskiz.uz/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+        signal: AbortSignal.timeout(10000)
+    });
+    const result = await response.json();
+    const token = result?.data?.token;
+    if (!response.ok || typeof token !== "string" || !token) throw new Error("Eskiz login failed");
+    eskizToken = token;
+    eskizTokenAt = Date.now();
+    return eskizToken;
+}
+
+async function sendEskizSms(phone, message) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const token = await getEskizToken(attempt > 0);
+        const body = new FormData();
+        body.set("mobile_phone", phone);
+        body.set("message", message);
+        body.set("from", ESKIZ_FROM);
+        const response = await fetch("https://notify.eskiz.uz/api/message/sms/send", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
+            body,
+            signal: AbortSignal.timeout(10000)
+        });
+        if (response.status === 401 && attempt === 0) {
+            eskizToken = "";
+            continue;
+        }
+        if (!response.ok) throw new Error(`Eskiz SMS request failed (${response.status})`);
+        return;
+    }
+    throw new Error("Eskiz authorization failed");
+}
+
+async function handleSms(req, res) {
+    if (SMS_CLIENT_KEY.length < 32 || !ESKIZ_EMAIL || !ESKIZ_PASSWORD) {
+        sendJson(res, 503, { error: "SMS service is not configured" });
+        return;
+    }
+    if (!hasValidSmsKey(req.headers.authorization?.replace(/^Bearer\s+/i, ""))) {
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+    }
+    if (!takeRateLimit(requestIp(req)) || !withinDailyLimit()) {
+        sendJson(res, 429, { error: "SMS request limit reached" });
+        return;
+    }
+    const body = await readJsonBody(req);
+    if (!body || typeof body !== "object" || Array.isArray(body) ||
+        typeof body.key !== "string" || !/^[a-zA-Z0-9:_-]{1,160}$/.test(body.key) ||
+        typeof body.phone !== "string" || !/^998\d{9}$/.test(body.phone) ||
+        typeof body.name !== "string" || !body.name.trim() || body.name.length > 200 ||
+        typeof body.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(body.date)) {
+        sendJson(res, 400, { error: "Invalid SMS request" });
+        return;
+    }
+    const previous = sentSmsKeys.get(body.key);
+    if (previous && Date.now() - previous < 48 * 60 * 60 * 1000) {
+        sendJson(res, 200, { sent: true, duplicate: true });
+        return;
+    }
+    if (pendingSmsKeys.has(body.key)) {
+        sendJson(res, 409, { error: "SMS request is already being processed" });
+        return;
+    }
+    pendingSmsKeys.add(body.key);
+    try {
+        const message = `Kunora eslatma: ${body.name.trim()} (${body.date})`.slice(0, 250);
+        await sendEskizSms(body.phone, message);
+        sentSmsKeys.set(body.key, Date.now());
+        sendJson(res, 200, { sent: true });
+    } finally {
+        pendingSmsKeys.delete(body.key);
+    }
 }
 
 function readJsonBody(req) {
@@ -337,7 +438,7 @@ const server = http.createServer(async (req, res) => {
         res.setHeader("Access-Control-Allow-Origin", origin);
         res.setHeader("Vary", "Origin");
     }
-    if (url.pathname === "/api/chat" && req.method === "OPTIONS") {
+    if (["/api/chat", "/api/sms"].includes(url.pathname) && req.method === "OPTIONS") {
         if (req.headers.origin && !origin) {
             res.writeHead(403, { "Cache-Control": "no-store" });
             res.end();
@@ -345,7 +446,7 @@ const server = http.createServer(async (req, res) => {
         }
         res.writeHead(204, {
             "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
             "Vary": "Origin"
         });
         res.end();
@@ -359,6 +460,18 @@ const server = http.createServer(async (req, res) => {
                 const status = Number.isInteger(error.status) ? error.status : 500;
                 if (status === 500) console.error("Chat endpoint error:", error);
                 sendJson(res, status, { error: status === 500 ? "Internal server error" : error.message });
+            }
+        }
+        return;
+    }
+    if (url.pathname === "/api/sms" && req.method === "POST") {
+        try {
+            await handleSms(req, res);
+        } catch (error) {
+            if (!res.headersSent && !res.destroyed) {
+                const status = Number.isInteger(error.status) ? error.status : 502;
+                if (status >= 500) console.error("SMS endpoint error:", error);
+                sendJson(res, status, { error: status >= 500 ? "SMS sending failed" : error.message });
             }
         }
         return;
